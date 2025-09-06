@@ -1,15 +1,19 @@
-from flask import Flask, request, render_template
-import hashlib
-import requests
+from flask import Flask, request, render_template, send_from_directory
+import hashlib, requests, os
 
 app = Flask(__name__)
-files = {}
-RASPBERRY_PI_IP = "10.225.209.10"
-SERVER_IP = "10.225.209.24"
+PI_CLIENT = "http://10.225.209.10:5000"
+SERVER_IP = "http://10.225.209.24:5000"
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    try:
+        status = requests.get(f"{PI_CLIENT}/status").text.strip()
+        in_progress = requests.get(f"{PI_CLIENT}/progress").text.strip()
+    except Exception:
+        status = "Error connecting to Pi"
+        in_progress = "N/A"
+    return render_template("index.html", status=status, in_progress=in_progress)
 
 @app.route('/upload', methods=['POST'])
 def upload():
@@ -19,36 +23,34 @@ def upload():
     if not file1 or not file2:
         return "Please upload both files", 400
 
-    try:
-        file1.save(file1.filename)
-        with open(file1.filename, "rb") as f:
-            digest1 = hashlib.sha256(f.read()).hexdigest()
+    file1.save(file1.filename)
+    file2.save(file2.filename)
 
-        file2.save(file2.filename)
-        with open(file2.filename, "rb") as f:
-            digest2 = hashlib.sha256(f.read()).hexdigest()
+    with open(file1.filename, "rb") as f:
+        digest1 = hashlib.sha256(f.read()).hexdigest()
+    with open(file2.filename, "rb") as f:
+        digest2 = hashlib.sha256(f.read()).hexdigest()
 
-        files['fw'] = True
-        files['key'] = True
-
-    except Exception as e:
-        files['fw'] = files['key'] = False
-        return f"Error saving files: {e}", 500
-
-    pi_url = f"http://{RASPBERRY_PI_IP}:5000/download"
-    server_url = f"http://{SERVER_IP}:5000/"
     payload = {
         "files": [
-            {"url": server_url+"ti_buck_fw.bin", "filename": file1.filename, "sha256": digest1},
-            {"url": server_url+"ti_buck_fw_key.bin", "filename": file2.filename, "sha256": digest2}
+            {"url": f"{SERVER_IP}/ti_buck_fw.bin", "filename": file1.filename, "sha256": digest1},
+            {"url": f"{SERVER_IP}/ti_buck_fw_key.bin", "filename": file2.filename, "sha256": digest2}
         ]
     }
 
     try:
-        response = requests.post(pi_url, json=payload, timeout=10)
+        response = requests.post(f"{PI_CLIENT}/download", json=payload, timeout=10)
         return f"Pi response: {response.text}"
     except Exception as e:
         return f"Failed to contact Pi: {e}"
+
+@app.route('/ti_buck_fw.bin')
+def serve_fw():
+    return send_from_directory(os.getcwd(), "ti_buck_fw.bin")
+
+@app.route('/ti_buck_fw_key.bin')
+def serve_key():
+    return send_from_directory(os.getcwd(), "ti_buck_fw_key.bin")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)

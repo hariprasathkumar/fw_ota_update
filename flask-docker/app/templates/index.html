@@ -10,5 +10,13 @@
         <input type="file" name="key">
         <button type="submit">Trigger</button>
     </form>
+    <h2>PMIC FW Downloader</h2>
+
+    <p>Status: {{ status }}</p>
+    <p>Progress: {{ in_progress }}</p>
+
+    <form method="GET" action="/">
+        <button type="submit">Refresh Status</button>
+    </form>
 </body>
 </html>
