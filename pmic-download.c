@@ -74,7 +74,7 @@ static void dwnld_work_process(const struct firmware *f)
         pr_info("[pmic-download] block %d = %s\n", blocks, buf);
     }
 
-    size_t rest = atomic_read(&current_byte) + rem;
+    u32 rest = atomic_read(&current_byte) + rem;
     for ( ; atomic_read(&current_byte) < rest; atomic_inc(&current_byte)) {
         u32 idx = atomic_read(&current_byte);
         pr_info("[pmic-download] byte %d = %c \n", idx, *(d + idx));
@@ -91,7 +91,7 @@ static void dwnld_work_handler(struct work_struct *work)
     /* int request_firmware(const struct firmware **fw, const char *name,
 		     struct device *device);*/
     ret = request_firmware(&fw, "ti_buck_fw.bin", dwnld_device);
-    if (ret < 0) {
+    if (ret < 0 || !fw) {
         pr_err("[pmic-download] fw loading failed error code : %d\n", ret);
         atomic_set(&dwnld_in_progress, 0);
         atomic_set(&current_byte, 0);
@@ -100,7 +100,7 @@ static void dwnld_work_handler(struct work_struct *work)
     }
 
     ret = request_firmware(&key, "ti_buck_fw_key.bin", dwnld_device);
-    if (ret < 0) {
+    if (ret < 0 || !key) {
         pr_err("[pmic-download] key loading failed error code : %d\n", ret);
         release_firmware(fw);
         atomic_set(&dwnld_in_progress, 0);
@@ -154,7 +154,7 @@ static int __init pmic_download_init(void)
        void device_destroy(const struct class *cls, dev_t devt); */
     if (device_create_file(dwnld_device, &dev_attr_trigger)) {
         pr_err("[pmic-download] Trigger File creation Failed \n");
-        device_destroy(dwnld_device, 0);
+        device_destroy(dwnld_class, 0);
         class_destroy(dwnld_class);
         return -ENOMEM;
     }
@@ -162,7 +162,7 @@ static int __init pmic_download_init(void)
     if (device_create_file(dwnld_device, &dev_attr_status)) {
         pr_err("[pmic-download] Status File creation Failed \n");
         device_remove_file(dwnld_device, &dev_attr_trigger);
-        device_destroy(dwnld_device, 0);
+        device_destroy(dwnld_class, 0);
         class_destroy(dwnld_class);
         return -ENOMEM;
     }
@@ -171,7 +171,7 @@ static int __init pmic_download_init(void)
         pr_err("[pmic-download] Progress File creation Failed \n");
         device_remove_file(dwnld_device, &dev_attr_trigger);
         device_remove_file(dwnld_device, &dev_attr_status);
-        device_destroy(dwnld_device, 0);
+        device_destroy(dwnld_class, 0);
         class_destroy(dwnld_class);
         return -ENOMEM;
     }
@@ -186,7 +186,7 @@ static int __init pmic_download_init(void)
         device_remove_file(dwnld_device, &dev_attr_trigger);
         device_remove_file(dwnld_device, &dev_attr_status);
         device_remove_file(dwnld_device, &dev_attr_progress);
-        device_destroy(dwnld_device, 0);
+        device_destroy(dwnld_class, 0);
         class_destroy(dwnld_class);
         return -ENOMEM;
     }
@@ -205,7 +205,7 @@ static void __exit pmic_download_exit(void)
     device_remove_file(dwnld_device, &dev_attr_trigger);
     device_remove_file(dwnld_device, &dev_attr_status);
     device_remove_file(dwnld_device, &dev_attr_progress);
-    device_destroy(dwnld_device, 0);
+    device_destroy(dwnld_class, 0);
     class_destroy(dwnld_class);
     /* bool cancel_delayed_work_sync(struct delayed_work *dwork); */
     cancel_delayed_work_sync(&dwnld_work);
