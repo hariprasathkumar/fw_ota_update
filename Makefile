@@ -1,9 +1,10 @@
-obj-m := pmic-download.o                       
+obj-m := pmic-download.o
 PWD := $(shell pwd)
+KDIR := /lib/modules/$(shell uname -r)/build
 
 all:
-	make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- -C /home/hari/kernel/rpi-kernel M=$(PWD) modules
+	make -C $(KDIR) M=$(PWD) modules
 
 
 clean:
-	make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- -C /home/hari/kernel/rpi-kernel m=$(PWD) clean
+	make -C $(KDIR) M=$(PWD) clean
