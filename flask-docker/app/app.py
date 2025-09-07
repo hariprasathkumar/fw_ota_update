@@ -2,8 +2,8 @@ from flask import Flask, request, render_template, send_from_directory
 import hashlib, requests, os
 
 app = Flask(__name__)
-PI_CLIENT = "http://10.225.209.10:5000"
-SERVER_IP = "http://10.225.209.24:5000"
+SERVER_IP = "http://192.168.1.103:5000"
+PI_CLIENT = "http://192.168.1.101:5000"
 
 @app.route("/")
 def index():

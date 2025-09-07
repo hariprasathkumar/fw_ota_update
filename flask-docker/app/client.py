@@ -37,7 +37,7 @@ def download_endpoint():
             if f.get("sha256") and not verify_sha256(filepath, f["sha256"]):
                 return f"SHA256 mismatch for {f['filename']}", 400
 
-            if "fw" in f["filename"]:
+            if "ti_buck_fw.bin" in f["filename"]:
                 shutil.copy(filepath, fw_file)
             else:
                 shutil.copy(filepath, key_file)

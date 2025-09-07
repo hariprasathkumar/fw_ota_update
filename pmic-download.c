@@ -8,20 +8,38 @@
 #include <linux/firmware.h>
 #include <linux/types.h>
 #include <linux/atomic.h>
+#include <linux/i2c.h>
+#include <linux/mod_devicetable.h>
+#include <linux/random.h>
+#include <linux/crypto.h>
+#include <crypto/hash.h>
+#include <linux/slab.h>
+#include <linux/printk.h>
 
 MODULE_LICENSE("GPL");        
 MODULE_AUTHOR("Hari Prasath Kumar @ hari-kumar@ti.com");   
 MODULE_DESCRIPTION("TI PMIC FW Download kernel module");
 MODULE_VERSION("0.1");        
 
+#define NONCE_SIZE  32U
 
 struct class *dwnld_class = NULL;
 struct device *dwnld_device = NULL;
 struct workqueue_struct *dwnld_req = NULL;
 struct delayed_work dwnld_work = {0};
+struct i2c_client *dwnld_client = NULL;
 static atomic_t dwnld_in_progress = ATOMIC_INIT(0);
 static atomic_t current_byte = ATOMIC_INIT(0);
 static atomic_t total_bytes = ATOMIC_INIT(0);
+
+static s32 pmic_download_compute_hmac(bool mac, const char *algo_name, const u8 *data, u32 dlen, const u8 *key, u32 klen, u8 *digest);
+static s32 pmic_download_compute_sha384(const u8 *msg, u32 msg_len, u8 *hash384);
+static s32 pmic_download_write_chunk_fw(const u8 *f, u32 flen, const u8 *ephemeral_key);
+static void pmic_download_get_random_number(u8 *nonce);
+static s32 pmic_download_derive_mac_key(const u8 *nonce, const u8 *key, u8 *derived_key);
+static s32 pmic_download_update_buffer(const u8 *data, u32  dlen, u32 buffer_num);
+static s32 pmic_download_update_fw(const u8 *fw, u32 fwlen, const u8 *key, u32 klen);
+static void pmic_download_i2c_remove(struct i2c_client *client);
 
 static ssize_t status_show(struct device *dev,
                             struct device_attribute *attr,
@@ -57,29 +75,218 @@ static ssize_t trigger_store(struct device *dev,
     return count;
 }
 
-static void dwnld_work_process(const struct firmware *f) 
-{
-    size_t blocks = f->size / 32;
-    size_t rem = f->size - (blocks*32);
-    char *d = (char *)f->data;
-    atomic_set(&current_byte, 0);
-    atomic_set(&total_bytes, f->size);
-    while (blocks--) {
-        char buf[33];
-        for (u32 b = 0; b < 32; b++) {
-            buf[b] = d[atomic_read(&current_byte)];
-            atomic_inc(&current_byte);
-        }
-        buf[32] = '\0';
-        pr_info("[pmic-download] block %d = %s\n", blocks, buf);
+#define BUFFER_0   0
+#define BUFFER_1   1
+#define BUFFER_2   2
+
+
+static s32 pmic_download_compute_hmac(bool mac, const char *algo_name, const u8 *data, u32 dlen, const u8 *key, u32 klen, u8 *digest) {
+    struct crypto_shash *hmac_handle = NULL;
+    struct shash_desc *hmac_ctxt = NULL;
+    s32 ret;
+
+    if (!algo_name || !data || !digest) {
+        pr_err("[pmic-download] invalid args\n");
+        return -EINVAL;
     }
 
-    u32 rest = atomic_read(&current_byte) + rem;
-    for ( ; atomic_read(&current_byte) < rest; atomic_inc(&current_byte)) {
-        u32 idx = atomic_read(&current_byte);
-        pr_info("[pmic-download] byte %d = %c \n", idx, *(d + idx));
+    /* struct crypto_shash *crypto_alloc_shash(const char *alg_name, u32 type,
+					u32 mask); */
+    hmac_handle = crypto_alloc_shash(algo_name, 0, 0);
+    if (IS_ERR(hmac_handle)) {
+        pr_err("[pmic-download] hmac allocation failed %ld \n", PTR_ERR(hmac_handle));
+        return PTR_ERR(hmac_handle);
     }
+
+    hmac_ctxt = kmalloc(sizeof(*hmac_ctxt) + crypto_shash_descsize(hmac_handle), GFP_KERNEL);
+    if (!hmac_ctxt) {
+        pr_err("[pmic-download] hmac context allocation failed %ld \n", PTR_ERR(hmac_ctxt));
+        /* void crypto_free_shash(struct crypto_shash *tfm) */
+        crypto_free_shash(hmac_handle);
+        return -ENOMEM;
+    }
+
+    hmac_ctxt->tfm = hmac_handle;
+
+    if (mac) {
+        if (!key) {
+            pr_err("[pmic-download] key null\n");
+            return -EINVAL;
+        }
+        ret = crypto_shash_setkey(hmac_handle, key, klen);
+        if (ret) goto err;
+    }
+
+    ret = crypto_shash_init(hmac_ctxt);
+    if (ret) goto err;
+
+    ret = crypto_shash_update(hmac_ctxt, data, dlen);
+    if (ret) goto err;
+
+    ret = crypto_shash_final(hmac_ctxt, digest);
+
+err:
+    kfree(hmac_ctxt);
+    crypto_free_shash(hmac_handle);
+    return ret;
 }
+
+
+static s32 pmic_download_compute_sha384(const u8 *msg, u32 msg_len, u8 *hash384) {
+    return pmic_download_compute_hmac(false, "sha384", msg, msg_len, NULL, 0, hash384);
+}
+
+
+static s32 pmic_download_write_chunk_fw(const u8 *f, u32 flen, const u8 *ephemeral_key) {
+    s32 ret;
+    u8 hash384[48] = {0};
+    u8 digest[32] = {0};
+
+    ret = pmic_download_compute_sha384(f, flen, hash384);
+    if (ret < 0) return ret;
+
+    ret = pmic_download_compute_hmac(true, "hmac(sha256)", (const u8 *)f, flen, ephemeral_key, 32, digest);
+    if (ret < 0) return ret;
+
+    /* Select Buffer 2 -> reset window, 1kB at a time FW */
+    ret = pmic_download_update_buffer(f, flen, BUFFER_2);
+    pr_info("[pmic-download] pmic_download_update_buffer %d \n", BUFFER_2);
+    if (ret < 0) return ret;
+
+    /* Select Buffer 0 -> Write MAC Digest */
+    ret = pmic_download_update_buffer(digest, 32, BUFFER_0);
+    pr_info("[pmic-download] pmic_download_update_buffer %d\n" , BUFFER_0);
+    if (ret < 0) return ret;
+
+    /* Trigger Program */
+    ret = 0; // i2c_smbus_write_byte_data(dwnld_client, 0x68, 0x80);
+    if (ret < 0) return ret;
+
+    return 0;
+}
+
+static s32 pmic_download_fw_chunk_update(const u8 *f, u32 flen, u32 buffer_num) 
+{
+    u32 blocks = flen / 32;
+    u32 rem    = flen % 32;
+    s32 ret;
+    u32 i = 0;
+    u8 buf[32];
+
+    pr_info("[pmic-download] pmic_download_fw_chunk_update len = %d blocks = %d, rem = %d \n", flen, blocks, rem);
+
+    for (u32 blk_idx = 0; blk_idx < blocks; blk_idx++) {
+        for (u32 b = 0; b < 32; b++, i++) {
+            buf[b] = f[i];
+            if (buffer_num == BUFFER_2)
+                atomic_inc(&current_byte);
+        }
+
+        ret = 0; // i2c_smbus_write_block_data(dwnld_client, 0x81, 32, buf);
+        if (ret < 0) {
+            pr_err("[pmic-download] err at block %u\n", blk_idx);
+            return ret;
+        }
+        pr_info("[pmic-download] sent block %u\n", blk_idx);
+    }
+
+    if (rem) {
+        memset(buf, 0, sizeof(buf));
+        for (u32 b = 0; b < rem; b++, i++) {
+            buf[b] = f[i];
+            if (buffer_num == BUFFER_2)
+                atomic_inc(&current_byte);
+        }
+
+        ret = 0; // i2c_smbus_write_block_data(dwnld_client, 0x81, 32, buf);
+        if (ret < 0) {
+            pr_err("[pmic-download] err at last block\n");
+            return ret;
+        }
+        pr_info("[pmic-download] sent last partial block\n");
+    }
+    
+    return 0;
+}
+
+static void pmic_download_get_random_number(u8 *nonce) {
+    get_random_bytes(nonce, NONCE_SIZE);
+}
+
+static s32 pmic_download_derive_mac_key(const u8 *nonce, const u8 *key, u8 *derived_key) {
+
+    u8 msg[25+NONCE_SIZE] = {0};
+    char str[] = "VR security protocol";
+    const u8 *p = nonce;
+    s32 ret;
+
+    for (u32 i = 0; i < NONCE_SIZE; i++) msg[2+i] = *p++;
+    for (u32 i = 0; i < 20; i++) msg[35+i] = str[i]; // without null
+    msg[1] = msg[55] = 0x01;
+
+    /* derived_key = HMAC(msg, key) */
+    ret = pmic_download_compute_hmac(true, "hmac(sha256)", (const u8 *)msg, 25 + NONCE_SIZE, key, 32, derived_key);
+    if (ret) return ret;
+
+    return 0;
+}
+
+static s32 pmic_download_update_buffer(const u8 *data, u32  dlen, u32 buffer_num) {
+    s32 ret;
+
+    /* Set Buffer target */
+    ret = 0; // i2c_smbus_write_byte_data(dwnld_client, 0x66, buffer_num);
+    if (ret < 0) {
+        pr_info("[pmic-download] err i2c write byte %d", ret);
+        return ret;
+    }
+
+    /* Reset window */
+    ret = 0; // i2c_smbus_write_byte_data(dwnld_client, 0x67, 0);
+    if (ret < 0) return ret;
+
+    pr_info("[pmic-download] pmic_download_fw_chunk_update \n");
+    ret = pmic_download_fw_chunk_update(data, dlen, buffer_num);
+    if (ret < 0) return ret;
+
+    return 0;
+}
+
+static s32 pmic_download_update_fw(const u8 *fw, u32 fwlen, const u8 *key, u32 klen) {
+    u8 nonce[NONCE_SIZE];
+    u8 ephemeral_key[32];
+    s32 ret;
+    const u8 *f = NULL;
+
+    pmic_download_get_random_number(nonce);
+    pr_info("[pmic-download] Random number generated \n");
+
+    ret = pmic_download_derive_mac_key((const u8 *)nonce, (const u8 *)key, ephemeral_key);
+    if (ret) return ret;
+    pr_info("[pmic-download] EPHEMERAL_KEY generated \n");
+    
+    /* Select Buffer 1 -> write Nonce */
+    ret = pmic_download_update_buffer(nonce, NONCE_SIZE, BUFFER_1);
+    if (ret < 0) return ret;
+
+    f = fw;
+    atomic_set(&total_bytes, fwlen);
+    atomic_set(&current_byte, 0);
+
+    while (fwlen) {
+        size_t chunk_len = min(1024U, fwlen);
+        ret = pmic_download_write_chunk_fw(f, chunk_len, ephemeral_key);
+        pr_info("[pmic-download] FW_DATA chunk %d \n", chunk_len);
+
+        if (ret < 0) return ret;
+
+        f += 1024;
+        fwlen -= chunk_len;
+    }
+
+    return 0;
+}
+
 
 static void dwnld_work_handler(struct work_struct *work)
 {
@@ -109,29 +316,66 @@ static void dwnld_work_handler(struct work_struct *work)
         return;
     }
 
-    pr_info("[pmic-download] processing key \n");
-    dwnld_work_process(key);
+    ret = pmic_download_update_fw(fw->data, fw->size, key->data, key->size);
+    if (ret < 0) {
+        pr_info("[pmic-download] error during download %d\n", ret);
+    } else {
+        pr_info("[pmic-download] fw_work_handler completed\n"); 
+    }
 
-    pr_info("[pmic-download] processing fw \n");
-    dwnld_work_process(fw);
-
-    pr_info("[pmic-download] fw_work_handler completed\n"); 
-    
     /* void release_firmware(const struct firmware *fw); */
     release_firmware(fw);
     release_firmware(key);
     atomic_set(&dwnld_in_progress, 0);
     atomic_set(&current_byte, 0);
-    atomic_set(&total_bytes, 0);
 }
+
+
+static int pmic_download_i2c_probe(struct i2c_client *client,
+                                   const struct i2c_device_id *id) {
+    dwnld_client = client;
+    
+    return 0;
+}
+
+static void pmic_download_i2c_remove(struct i2c_client *client) {
+    dwnld_client = NULL;
+    pr_info("[pmic-download] pmic_download_i2c_remove \n");
+}
+
 static DEVICE_ATTR_WO(trigger);
 static DEVICE_ATTR_RO(status);
 static DEVICE_ATTR_RO(progress);
 
+/* int i2c_register_driver(struct module *owner, struct i2c_driver *driver); */
+static const struct i2c_device_id pmic_id[] = {
+    { "ti-pmic-fw-dwnld", 0 },
+    { }
+};
+MODULE_DEVICE_TABLE(i2c, pmic_id);
+
+static struct i2c_driver driver_if = {
+    .driver = {
+        .name = "ti-pmic-fw-dwnld",
+    },
+    .probe = pmic_download_i2c_probe,
+    .remove = pmic_download_i2c_remove,
+    .id_table = pmic_id,
+};
+
+
 static int __init pmic_download_init(void)
 {
+    int ret;
+
     pr_info("[pmic-download] module loaded\n");
-    
+
+    ret = i2c_register_driver(THIS_MODULE, &driver_if);
+    if (ret < 0) {
+        pr_err("[pmic-download] Cannot register to I2C Core\n");
+        return ret;
+    }
+
     dwnld_class = class_create(THIS_MODULE, "pmic_fw_downloader");
     if (IS_ERR(dwnld_class)) {
         pr_err("[pmic-download] Class creation failed\n");
@@ -200,6 +444,7 @@ static int __init pmic_download_init(void)
 
 static void __exit pmic_download_exit(void)
 {
+    i2c_del_driver(&driver_if);
     /* void device_remove_file(struct device *dev,
 			const struct device_attribute *attr); */
     device_remove_file(dwnld_device, &dev_attr_trigger);
