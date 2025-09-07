@@ -57,7 +57,4 @@ Client downloads, verifies, places files in /lib/firmware/, and triggers driver.
 make
 sudo insmod pmic_fw_downloader.ko
 
----
-### 📌 TODO:
-a. Enable I2C Transfer in download process
 
