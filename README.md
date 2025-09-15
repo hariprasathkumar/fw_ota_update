@@ -7,7 +7,7 @@ This project implements a simple **Over-The-Air (OTA) firmware update flow** usi
 
 ---
 
-## 🚀 Overview
+##  Overview
 
 - **Server (PC)**  
   - Hosts firmware and key files.  
@@ -31,7 +31,7 @@ This project implements a simple **Over-The-Air (OTA) firmware update flow** usi
   - Transfers segments to device over I²C SMBus block transfers. (Yet to be done)
 
 ---
-## ⚡ Usage
+##  Usage
 
 ### 1. Run the server (PC)
 ```bash
